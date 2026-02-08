@@ -85,7 +85,7 @@ class _RosettaLifecycleNode(Node):
 
         # These will be created in on_configure, None/empty indicates unconfigured
         # Following the demo pattern: check publisher existence and is_activated
-        self._obs_buffers: dict[str, tuple[ObservationStreamSpec, StreamBuffer]] = {}
+        self._obs_buffers: dict[str, list[tuple[ObservationStreamSpec, StreamBuffer]]] = {}
         self._act_publishers: dict[str, tuple[Any, Publisher]] = {}
         self._subscriptions: list[Any] = []
         self._watchdog_timer: Optional[Timer] = None
@@ -109,16 +109,19 @@ class _RosettaLifecycleNode(Node):
         """
         self.get_logger().info("on_configure() is called.")
 
-        # Create regular subscriptions (start buffering immediately)
+        # Build observation buffers (one per spec, grouped by topic)
         for spec in self._config.observation_specs:
             buffer = StreamBuffer.from_spec(spec)
-            self._obs_buffers[spec.topic] = (spec, buffer)
-            callback = partial(self._on_observation, spec=spec, buffer=buffer)
+            self._obs_buffers.setdefault(spec.topic, []).append((spec, buffer))
+
+        # Subscribe once per unique topic (start buffering immediately)
+        for topic, pairs in self._obs_buffers.items():
+            first_spec = pairs[0][0]
             sub = self.create_subscription(
-                get_message(spec.msg_type),
-                spec.topic,
-                callback,
-                qos_profile_from_dict(spec.qos) or 10,
+                get_message(first_spec.msg_type),
+                topic,
+                partial(self._on_observation_topic, topic=topic),
+                qos_profile_from_dict(first_spec.qos) or 10,
             )
             self._subscriptions.append(sub)
 
@@ -288,22 +291,21 @@ class _RosettaLifecycleNode(Node):
             msg = encode_value(spec, arr, stamp_ns)
             pub.publish(msg)
 
-    def _on_observation(
-        self, msg, spec: ObservationStreamSpec, buffer: StreamBuffer
-    ) -> None:
-        """Handle incoming observation message: extract timestamp, decode, and buffer."""
+    def _on_observation_topic(self, msg, topic: str) -> None:
+        """Handle incoming observation: decode per-spec and push to each buffer."""
         fallback_ns = self.get_clock().now().nanoseconds
-        ts_ns = get_message_timestamp_ns(msg, spec, fallback_ns)
 
-        # Log warning on first header fallback per stream
-        if spec.stamp_src == "header" and ts_ns == fallback_ns:
-            if spec.key not in self._header_warned:
-                self.get_logger().warning(
-                    f"Header stamp unavailable for '{spec.key}', using receive time"
-                )
-                self._header_warned.add(spec.key)
+        for spec, buffer in self._obs_buffers[topic]:
+            ts_ns = get_message_timestamp_ns(msg, spec, fallback_ns)
 
-        buffer.push(ts_ns, decode_value(msg, spec))
+            if spec.stamp_src == "header" and ts_ns == fallback_ns:
+                if spec.key not in self._header_warned:
+                    self.get_logger().warning(
+                        f"Header stamp unavailable for '{spec.key}', using receive time"
+                    )
+                    self._header_warned.add(spec.key)
+
+            buffer.push(ts_ns, decode_value(msg, spec))
 
     def _log_stream_state(self, key: str, is_missing: bool) -> None:
         """Log on state transitions only (missing <-> recovered)."""
@@ -344,20 +346,21 @@ class _RosettaLifecycleNode(Node):
         obs = {}
         now_ns = self.get_clock().now().nanoseconds
 
-        for spec, buffer in self._obs_buffers.values():
-            data = buffer.sample(now_ns)
-            self._log_stream_state(spec.key, data is None)
+        for pairs in self._obs_buffers.values():
+            for spec, buffer in pairs:
+                data = buffer.sample(now_ns)
+                self._log_stream_state(spec.key, data is None)
 
-            if spec.is_image:
-                key = spec.key.removeprefix("observation.images.")
-                if data is not None:
-                    obs[key] = data  # (H, W, C) uint8 from decode_value()
+                if spec.is_image:
+                    key = spec.key.removeprefix("observation.images.")
+                    if data is not None:
+                        obs[key] = data  # (H, W, C) uint8 from decode_value()
+                    else:
+                        obs[key] = zeros_for_spec(spec)
                 else:
-                    obs[key] = zeros_for_spec(spec)
-            else:
-                names = get_namespaced_names(spec)
-                for i, name in enumerate(names):
-                    obs[name] = float(data[i]) if data is not None else 0.0
+                    names = get_namespaced_names(spec)
+                    for i, name in enumerate(names):
+                        obs[name] = float(data[i]) if data is not None else 0.0
 
         return obs
 
