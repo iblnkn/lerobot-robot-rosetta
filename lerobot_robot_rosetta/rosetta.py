@@ -109,7 +109,7 @@ class _TopicBridge:
 
         # Safety state
         self._last_action_ns: Optional[int] = None
-        self._last_sent: dict[str, np.ndarray] = {}
+        self._last_sent: dict[str, dict[str, float]] = {}
 
         # Reference to the host node (set in setup, cleared in teardown)
         self._node: Optional[Any] = None
@@ -199,10 +199,20 @@ class _TopicBridge:
                 continue
             if spec.safety_behavior == "none":
                 continue
+            publish_names = list(spec.full_names or spec.names)
+
             if spec.safety_behavior == "hold" and topic in self._last_sent:
-                arr = self._last_sent[topic]
+                values_by_name = self._last_sent[topic]
+                arr = np.array(
+                    [values_by_name.get(name, 0.0) for name in publish_names],
+                    dtype=np.float32,
+                )
             else:
-                arr = np.zeros(len(spec.names), dtype=np.float32)
+                arr = np.zeros(len(publish_names), dtype=np.float32)
+
+            self._last_sent[topic] = {
+                name: float(arr[i]) for i, name in enumerate(publish_names)
+            }
             msg = encode_value(spec, arr, stamp_ns)
             pub.publish(msg)
 
@@ -278,15 +288,38 @@ class _TopicBridge:
             if pub is None:
                 continue
 
-            names = get_namespaced_names(spec)
-            arr = np.array([action[name] for name in names], dtype=np.float32)
+            namespaced_names = get_namespaced_names(spec)
+            model_values_by_name = {
+                name: float(action[namespaced_name])
+                for name, namespaced_name in zip(spec.names, namespaced_names)
+            }
+
+            publish_names = list(spec.full_names or spec.names)
+            if publish_names:
+                previous_values = self._last_sent.get(topic, {})
+                values_by_name: dict[str, float] = {}
+                for name in publish_names:
+                    if name in model_values_by_name:
+                        values_by_name[name] = model_values_by_name[name]
+                    elif spec.safety_behavior == "hold":
+                        values_by_name[name] = float(previous_values.get(name, 0.0))
+                    else:
+                        values_by_name[name] = 0.0
+
+                arr = np.array([values_by_name[name] for name in publish_names], dtype=np.float32)
+                self._last_sent[topic] = values_by_name
+            else:
+                arr = np.array([action[name] for name in namespaced_names], dtype=np.float32)
+                self._last_sent[topic] = {
+                    name: float(arr[i]) for i, name in enumerate(spec.names)
+                }
+
             msg = encode_value(spec, arr, stamp_ns)
 
             # Lifecycle publisher handles active/inactive state automatically
             pub.publish(msg)
-            self._last_sent[topic] = arr
 
-            for name in names:
+            for name in namespaced_names:
                 sent[name] = action[name]
 
         self._last_action_ns = stamp_ns
